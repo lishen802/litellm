@@ -168,6 +168,7 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.common_utils.callback_utils import (
+    is_named_callback_definition,
     is_sensitive_callback_key,
     normalize_callback_names,
     process_callback,
@@ -5904,6 +5905,9 @@ def _configured_db_callbacks(litellm_settings: Mapping[str, object], setting_key
     return tuple((setting_key, callback) for callback in callbacks if isinstance(callback, str))
 
 
+_CALLBACK_SETTINGS_ADAPTER: Final = TypeAdapter(dict[str, object])
+
+
 class ProxyConfig:
     """
     Abstraction class on top of config loading/updating logic. Gives us one place to control all config updating logic.
@@ -6301,6 +6305,13 @@ class ProxyConfig:
         }
 
     def _resolved_config_value(self, key: str, value: object, depth: int, max_depth: int) -> object:
+        if key == "callback_settings" and depth == 0 and isinstance(value, dict):
+            return {
+                name: definition
+                if is_named_callback_definition(definition)
+                else self._resolved_config_value(key=name, value=definition, depth=depth + 1, max_depth=max_depth)
+                for name, definition in _CALLBACK_SETTINGS_ADAPTER.validate_python(value).items()
+            }
         if isinstance(value, dict):
             return self._check_for_os_environ_vars(config=value, depth=depth + 1, max_depth=max_depth)
         if isinstance(value, list):

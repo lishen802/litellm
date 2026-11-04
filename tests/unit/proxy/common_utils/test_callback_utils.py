@@ -11,7 +11,7 @@ import litellm
 from litellm.caching.caching import DualCache
 from litellm.constants import MAX_GUARDRAIL_SCAN_METADATA_HEADER_LENGTH
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import AddTeamCallback, UserAPIKeyAuth
 from litellm.proxy.common_utils.callback_utils import (
     _serialize_scan_metadata_header,
     add_guardrail_scan_id,
@@ -21,8 +21,10 @@ from litellm.proxy.common_utils.callback_utils import (
     get_logging_caching_headers,
     get_remaining_tokens_and_requests_from_request_data,
     initialize_callbacks_on_proxy,
+    named_callback_resolution_error,
     normalize_callback_names,
     process_callback,
+    resolve_named_callback,
     sanitize_openai_provider_metadata,
     strip_callback_config,
 )
@@ -775,3 +777,44 @@ def test_initialize_callbacks_on_proxy_accepts_instance_non_list_value(probe_con
 
     assert len(litellm.callbacks) == 1
     assert isinstance(litellm.callbacks[0], CustomLogger)
+
+
+_ARIZE_REFERENCE_SETTINGS: Final = {
+    "arize_space_a": {
+        "callback_type": "arize",
+        "arize_api_key": "os.environ/LIT10061_ARIZE_API_KEY",
+        "arize_space_id": "os.environ/LIT10061_ARIZE_SPACE_ID",
+    },
+    "otel": {"message_logging": False},
+    "audit_sink": {"callback_type": "generic_api", "endpoint": "https://sink.local", "headers": {}},
+}
+_REFERENCE_ENTRY: Final = {"callback_name": "arize_space_a", "callback_type": "success", "callback_vars": {}}
+
+
+def test_named_callback_resolution_error_names_the_secret_it_could_not_read(monkeypatch):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    monkeypatch.delenv("LIT10061_ARIZE_API_KEY", raising=False)
+    monkeypatch.setenv("LIT10061_ARIZE_SPACE_ID", "space-a")
+
+    error: Final = named_callback_resolution_error([_REFERENCE_ENTRY])
+
+    assert error is not None
+    assert "callback_settings.arize_space_a.arize_api_key" in error
+    assert "space-a" not in error
+
+
+def test_named_callback_resolution_error_is_none_once_every_secret_reads(monkeypatch):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    monkeypatch.setenv("LIT10061_ARIZE_API_KEY", "key")
+    monkeypatch.setenv("LIT10061_ARIZE_SPACE_ID", "space-a")
+
+    assert named_callback_resolution_error([_REFERENCE_ENTRY]) is None
+    assert named_callback_resolution_error("not-a-list") is None
+
+
+@pytest.mark.parametrize("callback_name", ["otel", "audit_sink", "arize"])
+def test_callback_settings_without_a_backend_are_not_references(monkeypatch, callback_name):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    callback: Final = AddTeamCallback(callback_name=callback_name, callback_vars={})
+
+    assert resolve_named_callback(callback) is callback

@@ -1,12 +1,12 @@
 import copy
 import json
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Optional, TypeAlias
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from typing_extensions import ReadOnly, TypedDict, assert_never
 
 import litellm
@@ -27,7 +27,7 @@ from litellm.litellm_core_utils.core_helpers import (
     get_or_create_metadata_bucket,
 )
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
-from litellm.proxy._types import CommonProxyErrors, LiteLLMPromptInjectionParams
+from litellm.proxy._types import AddTeamCallback, CommonProxyErrors, LiteLLMPromptInjectionParams
 from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
@@ -796,3 +796,85 @@ def _decrypt_or_passthrough(key: str, value: object) -> object:
     inner: Final = value[len(_CALLBACK_VAR_ENCRYPTED_PREFIX) :]
     decrypted: Final = decrypt_value_helper(value=inner, key=key, exception_type="debug", return_original_value=False)
     return decrypted if decrypted is not None else value
+
+
+_GENERIC_API_CALLBACK_TYPE: Final = "generic_api"
+_STRING_KEYED_MAPPING: Final = TypeAdapter(Mapping[str, object])
+_OBJECT_SEQUENCE: Final = TypeAdapter(tuple[object, ...])
+_SECRET_VALUE: Final[TypeAdapter[str | bool]] = TypeAdapter(str | bool)
+
+
+def is_named_callback_definition(definition: object) -> bool:
+    """Whether a ``callback_settings`` entry names a backend a key can reference.
+
+    Such an entry keeps its ``os.environ/`` values past config load, so the secret
+    manager is read on each request that uses it rather than once at boot.
+    """
+    if not isinstance(definition, Mapping):
+        return False
+    callback_type: Final = _STRING_KEYED_MAPPING.validate_python(definition).get("callback_type")
+    return isinstance(callback_type, str) and callback_type != _GENERIC_API_CALLBACK_TYPE
+
+
+def named_callback_definition(callback_name: str) -> Mapping[str, object] | None:
+    raw: Final[object] = litellm.callback_settings.get(callback_name)
+    if not is_named_callback_definition(raw):
+        return None
+    return _STRING_KEYED_MAPPING.validate_python(raw)
+
+
+def resolve_named_callback(callback: AddTeamCallback) -> AddTeamCallback:
+    """Swap a reference to a ``callback_settings`` definition for the backend it names.
+
+    The definition's values go through the secret manager on every call, so a rotated
+    secret is picked up by the next request. The key keeps only the reference name
+    and may add values the definition does not set.
+    """
+    definition: Final = named_callback_definition(callback.callback_name)
+    if definition is None:
+        return callback
+    definition_vars: Final = {
+        key: _resolved_definition_value(callback.callback_name, key, value)
+        for key, value in definition.items()
+        if key != "callback_type"
+    }
+    return AddTeamCallback(
+        callback_name=str(definition["callback_type"]),
+        callback_type=callback.callback_type,
+        callback_vars={**definition_vars, **callback.callback_vars},
+    )
+
+
+def named_callback_resolution_error(entries: object) -> str | None:
+    """Why a key's ``callback_settings`` references cannot be resolved right now, or None."""
+    items: Final = (
+        _OBJECT_SEQUENCE.validate_python(entries)
+        if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes))
+        else ()
+    )
+    return next((error for item in items if (error := _reference_resolution_error(item)) is not None), None)
+
+
+def _reference_resolution_error(item: object) -> str | None:
+    if not isinstance(item, Mapping):
+        return None
+    entry: Final = _STRING_KEYED_MAPPING.validate_python(item)
+    callback_name: Final = entry.get("callback_name")
+    if not isinstance(callback_name, str) or named_callback_definition(callback_name) is None:
+        return None
+    try:
+        resolve_named_callback(AddTeamCallback.model_validate(entry))
+    except (ValidationError, ValueError) as e:
+        return str(e)
+    return None
+
+
+def _resolved_definition_value(definition_name: str, key: str, value: object) -> str:
+    if value is None:
+        raise ValueError(f"callback_settings.{definition_name}.{key} is not set")
+    raw: Final = value if isinstance(value, str) else str(value)
+    resolved: Final = _SECRET_VALUE.validate_python(get_secret(raw, default_value=raw) or raw)
+    text: Final = resolved if isinstance(resolved, str) else str(resolved)
+    if "os.environ/" in text:
+        raise ValueError(f"callback_settings.{definition_name}.{key} could not be resolved from the secret manager")
+    return text

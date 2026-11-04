@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-from typing import cast
+from typing import Final, cast
 
 from fastapi import FastAPI
 
@@ -481,3 +481,80 @@ class TestNewRelicKeyLoggingValidation:
             )
         finally:
             is_otel_v2_enabled.cache_clear()
+
+
+_ARIZE_REFERENCE_SETTINGS: Final = {
+    "arize_space_a": {
+        "callback_type": "arize",
+        "arize_api_key": "os.environ/LIT10061_ARIZE_API_KEY",
+        "arize_space_id": "os.environ/LIT10061_ARIZE_SPACE_ID",
+    }
+}
+
+
+class TestCallbackReferenceKeyWrites:
+    @staticmethod
+    def _metadata(callback_name, **callback_vars):
+        return {"logging": [{"callback_name": callback_name, "callback_type": "success", "callback_vars": callback_vars}]}
+
+    @pytest.mark.parametrize("role", ["internal_user", "team", None])
+    def test_only_a_proxy_admin_can_point_a_key_at_a_definition(self, monkeypatch, role):
+        from fastapi import HTTPException
+
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.management_endpoints.key_management_endpoints import (
+            raise_on_unauthorized_callback_reference,
+        )
+
+        monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+        with pytest.raises(HTTPException) as exc:
+            raise_on_unauthorized_callback_reference(self._metadata("arize_space_a"), UserAPIKeyAuth(user_role=role))
+        assert exc.value.status_code == 403
+        assert "callback_settings" in str(exc.value.detail)
+
+    def test_a_proxy_admin_can_point_a_key_at_a_definition_and_add_its_own_values(self, monkeypatch):
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.management_endpoints.key_management_endpoints import (
+            raise_on_unauthorized_callback_reference,
+        )
+
+        monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+        assert (
+            raise_on_unauthorized_callback_reference(
+                self._metadata("arize_space_a", turn_off_message_logging="true"),
+                UserAPIKeyAuth(user_role="proxy_admin"),
+            )
+            is None
+        )
+
+    def test_a_key_cannot_override_a_value_its_definition_sets(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.management_endpoints.key_management_endpoints import (
+            raise_on_unauthorized_callback_reference,
+        )
+
+        monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+        with pytest.raises(HTTPException) as exc:
+            raise_on_unauthorized_callback_reference(
+                self._metadata("arize_space_a", arize_api_key="inline-key"), UserAPIKeyAuth(user_role="proxy_admin")
+            )
+        assert exc.value.status_code == 400
+        assert "arize_api_key" in str(exc.value.detail)
+
+    def test_an_inline_callback_entry_is_not_gated(self, monkeypatch):
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.management_endpoints.key_management_endpoints import (
+            raise_on_unauthorized_callback_reference,
+        )
+
+        monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+        assert (
+            raise_on_unauthorized_callback_reference(
+                self._metadata("arize", arize_api_key="inline-key", arize_space_id="space-b"),
+                UserAPIKeyAuth(user_role="internal_user"),
+            )
+            is None
+        )
+        assert raise_on_unauthorized_callback_reference(None, UserAPIKeyAuth(user_role="internal_user")) is None
